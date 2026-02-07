@@ -1,72 +1,138 @@
 #!/usr/bin/env bash
 #
-# reproduce.sh - Attempt to reproduce the GitHub Actions secret masking bug
+# reproduce.sh - Test GitHub Actions secret masking coverage
 #
-# Theory: When a repository/environment secret is changed while a workflow is
-# running, GitHub Actions may fail to mask the OLD secret value in the logs,
-# causing it to appear in clear text.
-#
-# This script tests multiple scenarios:
-#   1. Single-job rotation (original test)
-#   2. Multi-job artifact handoff (V1 passed to job that only knows V2)
-#   3. Continuous output during rotation (race condition surface)
-#   4. Buffer flush before print (log chunk boundary)
-#   5. Late rotation during print phase
-#   6. GITHUB_OUTPUT step passing
+# Tests which encodings/transformations of a secret value bypass masking.
+# GitHub masks the literal string and base64, but may miss other formats.
 #
 # Prerequisites:
 #   - gh CLI installed and authenticated
-#   - Repository: bentsolheim/github-actions-password-leak (or set REPO below)
+#   - Repository: bentsolheim/github-actions-password-leak (or set REPO)
 #
 # Usage:
 #   ./reproduce.sh
-#   REPO=owner/repo WAIT=60 ./reproduce.sh
-#   RAPID=1 ./reproduce.sh           # Rapid rotation mode (15 rotations)
+#   WAIT=60 ./reproduce.sh
 
 set -euo pipefail
 
 REPO="${REPO:-bentsolheim/github-actions-password-leak}"
 BRANCH="${BRANCH:-main}"
-WAIT="${WAIT:-60}"
-RAPID="${RAPID:-0}"
+WAIT="${WAIT:-30}"
 TIMESTAMP=$(date +%s)
 SECRET_NAME="TEST_SECRET"
-ORIGINAL_SECRET="original-secret-value-${TIMESTAMP}"
+SECRET_VALUE="original-secret-value-${TIMESTAMP}"
 CHANGED_SECRET="changed-secret-value-${TIMESTAMP}"
 
 echo "============================================"
-echo "GitHub Actions Secret Masking Bug Reproducer"
+echo " Secret Masking Transform Test"
 echo "============================================"
 echo ""
 echo "Repository:  $REPO"
 echo "Branch:      $BRANCH"
-echo "Secret:      $SECRET_NAME"
-echo "Original:    $ORIGINAL_SECRET"
-echo "Changed:     $CHANGED_SECRET"
+echo "Secret:      $SECRET_VALUE"
 echo "Wait time:   ${WAIT}s"
-echo "Rapid mode:  $RAPID"
-echo "Timestamp:   $TIMESTAMP"
 echo ""
 
-# Step 1: Set the initial secret value
-echo "[1/7] Setting initial secret value..."
-gh secret set "$SECRET_NAME" -R "$REPO" --body "$ORIGINAL_SECRET"
-echo "  Secret set to: $ORIGINAL_SECRET"
+# Pre-compute expected outputs for each transformation
+declare -A EXPECTED
+EXPECTED[LITERAL]="$SECRET_VALUE"
+EXPECTED[HEX_XXD]=$(printf '%s' "$SECRET_VALUE" | xxd -p | tr -d '\n')
+EXPECTED[HEX_OD]=$(printf '%s' "$SECRET_VALUE" | od -A n -t x1 | tr -d ' \n')
+EXPECTED[OCTAL]=$(printf '%s' "$SECRET_VALUE" | od -A n -t o1 | tr -d ' \n')
+EXPECTED[B64_NO_NL]=$(printf '%s' "$SECRET_VALUE" | base64)
+EXPECTED[B64_WITH_NL]=$(echo "$SECRET_VALUE" | base64)
+EXPECTED[BASE32]=$(printf '%s' "$SECRET_VALUE" | base32)
+EXPECTED[REVERSED]=$(echo "$SECRET_VALUE" | rev)
+EXPECTED[ROT13]=$(echo "$SECRET_VALUE" | tr 'a-zA-Z' 'n-za-mN-ZA-M')
+EXPECTED[UPPER]=$(echo "$SECRET_VALUE" | tr '[:lower:]' '[:upper:]')
+EXPECTED[CAESAR1]=$(echo "$SECRET_VALUE" | tr 'a-zA-Z0-9' 'b-za-aB-ZA-A1-90')
+EXPECTED[MD5]=$(printf '%s' "$SECRET_VALUE" | md5sum | cut -d' ' -f1)
+EXPECTED[SHA1]=$(printf '%s' "$SECRET_VALUE" | sha1sum | cut -d' ' -f1)
+EXPECTED[SHA256]=$(printf '%s' "$SECRET_VALUE" | sha256sum | cut -d' ' -f1)
+EXPECTED[FIRST_HALF]="${SECRET_VALUE:0:$(( ${#SECRET_VALUE} / 2 ))}"
+EXPECTED[SECOND_HALF]="${SECRET_VALUE:$(( ${#SECRET_VALUE} / 2 ))}"
+
+# Decimal ASCII
+DEC_ASCII=""
+for (( i=0; i<${#SECRET_VALUE}; i++ )); do
+  DEC_ASCII+="$(printf '%d ' "'${SECRET_VALUE:$i:1}")"
+done
+EXPECTED[DECIMAL_ASCII]="$DEC_ASCII"
+
+# HTML entities
+HTML_ENT=$(python3 -c "
+s = '$SECRET_VALUE'
+print(''.join(f'&#{ord(c)};' for c in s))
+")
+EXPECTED[HTML_ENTITIES]="$HTML_ENT"
+
+# Unicode escapes
+UNICODE_ESC=$(python3 -c "
+s = '$SECRET_VALUE'
+print(''.join(f'\\\\u{ord(c):04x}' for c in s))
+")
+EXPECTED[UNICODE_ESC]="$UNICODE_ESC"
+
+# URL encoding (only encodes special chars, letters/digits pass through)
+EXPECTED[URL_ENCODE]=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$SECRET_VALUE'))")
+EXPECTED[URL_ENCODE_ALL]=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$SECRET_VALUE', safe=''))")
+
+# Hex via printf
+HEX_PRINTF=""
+for (( i=0; i<${#SECRET_VALUE}; i++ )); do
+  HEX_PRINTF+=$(printf '%02x' "'${SECRET_VALUE:$i:1}")
+done
+EXPECTED[HEX_PRINTF]="$HEX_PRINTF"
+
+# Spaced chars
+EXPECTED[SPACED]=$(echo "$SECRET_VALUE" | sed 's/./& /g')
+
+# Even/odd chars
+EVEN=""
+ODD=""
+for (( i=0; i<${#SECRET_VALUE}; i++ )); do
+  if (( i % 2 == 0 )); then
+    EVEN+="${SECRET_VALUE:$i:1}"
+  else
+    ODD+="${SECRET_VALUE:$i:1}"
+  fi
+done
+EXPECTED[EVEN_CHARS]="$EVEN"
+EXPECTED[ODD_CHARS]="$ODD"
+
+# Binary
+EXPECTED[BINARY]=$(python3 -c "
+s = '$SECRET_VALUE'
+print(' '.join(f'{ord(c):08b}' for c in s))
+")
+
+# Artifact variants
+EXPECTED[ARTIFACT_LITERAL]="$SECRET_VALUE"
+EXPECTED[ARTIFACT_HEX]=$(printf '%s' "$SECRET_VALUE" | xxd -p | tr -d '\n')
+EXPECTED[ARTIFACT_B64]=$(printf '%s' "$SECRET_VALUE" | base64)
+EXPECTED[ARTIFACT_B64NL]=$(echo "$SECRET_VALUE" | base64)
+
+echo "Pre-computed ${#EXPECTED[@]} transformation patterns."
+echo ""
+
+# Step 1: Set the secret
+echo "[1/5] Setting secret..."
+gh secret set "$SECRET_NAME" -R "$REPO" --body "$SECRET_VALUE"
 sleep 2
 echo ""
 
-# Step 2: Trigger the workflow
-echo "[2/7] Triggering workflow..."
+# Step 2: Trigger workflow
+echo "[2/5] Triggering workflow..."
 gh workflow run secret-leak-test.yml \
   -R "$REPO" \
   --ref "$BRANCH" \
   -f "wait_seconds=$WAIT"
-echo "  Workflow triggered. Waiting 5s for it to register..."
+echo "  Waiting 5s for registration..."
 sleep 5
 echo ""
 
-# Step 3: Find the running workflow
-echo "[3/7] Finding the workflow run..."
+# Step 3: Find the run
+echo "[3/5] Finding workflow run..."
 RUN_ID=""
 for attempt in $(seq 1 24); do
   RUN_ID=$(gh run list \
@@ -90,292 +156,165 @@ for attempt in $(seq 1 24); do
   if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
     break
   fi
-
-  echo "  Attempt $attempt/24: Workflow not found yet, waiting 5s..."
+  echo "  Attempt $attempt/24: waiting 5s..."
   sleep 5
 done
 
 if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
-  echo "ERROR: Could not find the running workflow. Check manually:"
-  echo "  gh run list -R $REPO -w secret-leak-test.yml"
+  echo "ERROR: Could not find the workflow run."
   exit 1
 fi
 
-echo "  Found run: $RUN_ID"
+echo "  Run: $RUN_ID"
 echo "  URL: https://github.com/$REPO/actions/runs/$RUN_ID"
 echo ""
 
-# Step 4: Wait, then change the secret
-# For the multi-job test, we want to rotate AFTER the capture-secret job
-# finishes but BEFORE print-from-artifact starts.
-# For single-job tests, we rotate during the wait period.
+# Step 4: Rotate secret mid-run (for rotation tests)
 CHANGE_DELAY=$((WAIT / 3))
-if [ "$CHANGE_DELAY" -lt 10 ]; then
-  CHANGE_DELAY=10
-fi
-
-echo "[4/7] Waiting ${CHANGE_DELAY}s before changing the secret..."
-echo "  (Monitoring capture-secret job status...)"
-
-# Poll for capture-secret job completion to optimize rotation timing
-CAPTURE_JOB_DONE=false
-for i in $(seq 1 "$CHANGE_DELAY"); do
-  # Check if capture-secret job has completed
-  CAPTURE_STATUS=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
-    --jq '.jobs[] | select(.name == "capture-secret") | .status' 2>/dev/null || true)
-  if [ "$CAPTURE_STATUS" = "completed" ] && [ "$CAPTURE_JOB_DONE" = "false" ]; then
-    echo "  capture-secret job completed at t+${i}s — rotating NOW for multi-job test"
-    CAPTURE_JOB_DONE=true
-    # Don't break — let the delay continue for single-job tests
-  fi
-  if [ $((i % 10)) -eq 0 ]; then
-    echo "  t+${i}s (capture-secret: ${CAPTURE_STATUS:-unknown})"
-  fi
-  sleep 1
-done
-
-echo ""
-echo "  Changing secret NOW!"
+[ "$CHANGE_DELAY" -lt 10 ] && CHANGE_DELAY=10
+echo "[4/5] Waiting ${CHANGE_DELAY}s then rotating secret..."
+sleep "$CHANGE_DELAY"
 gh secret set "$SECRET_NAME" -R "$REPO" --body "$CHANGED_SECRET"
-echo "  Secret changed to: $CHANGED_SECRET"
-
-# Rapid rotation mode: rotate many times in quick succession
-if [ "$RAPID" = "1" ]; then
-  echo ""
-  echo "  Rapid rotation mode: performing 15 additional rotations..."
-  for i in $(seq 1 15); do
-    RAPID_SECRET="rapid-rotation-${i}-${TIMESTAMP}"
-    gh secret set "$SECRET_NAME" -R "$REPO" --body "$RAPID_SECRET"
-    echo "    Rotation $i/15: $RAPID_SECRET"
-    sleep 2
-  done
-  # Set the final "changed" value
-  gh secret set "$SECRET_NAME" -R "$REPO" --body "$CHANGED_SECRET"
-  echo "  Final value: $CHANGED_SECRET"
-fi
+echo "  Rotated to: $CHANGED_SECRET"
 echo ""
 
-# Step 5: Poll live logs while workflow is still running
-echo "[5/7] Polling live logs for leaks during execution..."
-LIVE_LOG_DIR=$(mktemp -d)
-LIVE_LEAK_FOUND=false
-
-for poll in $(seq 1 20); do
-  # Check if run is still going
-  RUN_STATUS=$(gh run view "$RUN_ID" -R "$REPO" --json status --jq '.status' 2>/dev/null || true)
-  if [ "$RUN_STATUS" = "completed" ]; then
-    echo "  Workflow completed during polling."
-    break
-  fi
-
-  # Try to get logs for each job
-  JOBS_JSON=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" 2>/dev/null || true)
-  if [ -n "$JOBS_JSON" ]; then
-    JOB_IDS=$(echo "$JOBS_JSON" | gh api --input - --jq '.jobs[].id' 2>/dev/null || \
-              echo "$JOBS_JSON" | python3 -c "import sys,json; [print(j['id']) for j in json.load(sys.stdin).get('jobs',[])]" 2>/dev/null || true)
-    for JOB_ID in $JOB_IDS; do
-      LIVE_LOG_FILE="${LIVE_LOG_DIR}/job-${JOB_ID}-poll-${poll}.log"
-      gh api "repos/${REPO}/actions/jobs/${JOB_ID}/logs" > "$LIVE_LOG_FILE" 2>/dev/null || true
-      if [ -s "$LIVE_LOG_FILE" ] && grep -q "$ORIGINAL_SECRET" "$LIVE_LOG_FILE" 2>/dev/null; then
-        LIVE_LEAK_FOUND=true
-        echo "  *** LIVE LEAK DETECTED in job $JOB_ID at poll $poll! ***"
-      fi
-    done
-  fi
-
-  echo "  Poll $poll/20 (status: ${RUN_STATUS:-unknown})"
-  sleep 5
-done
-echo ""
-
-# Step 6: Wait for workflow to complete and get final logs
-echo "[6/7] Waiting for workflow to complete..."
+# Wait for completion
+echo "  Waiting for workflow to complete..."
 gh run watch "$RUN_ID" -R "$REPO" --exit-status 2>/dev/null || true
-echo "  Workflow completed."
+echo "  Done."
 echo ""
 
-# Download final logs via multiple methods
-echo "[7/7] Analyzing logs..."
-echo ""
-
+# Step 5: Analyze logs
+echo "[5/5] Analyzing logs..."
 LOG_FILE=$(mktemp)
-LOG_ZIP=$(mktemp --suffix=.zip)
-
-# Method 1: gh run view --log
 gh run view "$RUN_ID" -R "$REPO" --log > "$LOG_FILE" 2>/dev/null || true
 
-# Method 2: API zip download
-gh api "repos/${REPO}/actions/runs/${RUN_ID}/logs" > "$LOG_ZIP" 2>/dev/null || true
-LOG_ZIP_DIR=$(mktemp -d)
-unzip -q -o "$LOG_ZIP" -d "$LOG_ZIP_DIR" 2>/dev/null || true
-
-echo "============================================"
-echo "           TEST RESULTS"
-echo "============================================"
+echo ""
+echo "============================================================"
+echo "  MASKING TRANSFORM RESULTS"
+echo "============================================================"
 echo ""
 
-TOTAL_TESTS=0
-LEAKS_FOUND=0
+# Categorize results
+LEAKED_LIST=()
+MASKED_LIST=()
 
-# Helper function
-check_leak() {
-  local TEST_NAME="$1"
-  local PATTERN="$2"
-  local LOG="$3"
-  TOTAL_TESTS=$((TOTAL_TESTS + 1))
+# Define display order and groupings
+declare -a GROUPS_ORDER=(
+  "CONTROLS"
+  "HEX_ENCODINGS"
+  "NUMERIC_ENCODINGS"
+  "BASE_ENCODINGS"
+  "URL_HTML_UNICODE"
+  "STRING_TRANSFORMS"
+  "PARTIAL_EXPOSURE"
+  "STRUCTURED_DATA"
+  "HASHES"
+  "ARTIFACT_CROSS_JOB"
+)
 
-  if grep -q "$PATTERN" "$LOG" 2>/dev/null; then
-    LEAKS_FOUND=$((LEAKS_FOUND + 1))
-    echo "  LEAKED  - $TEST_NAME"
-    grep -n "$PATTERN" "$LOG" 2>/dev/null | head -3 | while read -r line; do
-      echo "           $line"
-    done
-    return 0
+declare -A GROUP_NAMES
+GROUP_NAMES[CONTROLS]="Controls (should be masked)"
+GROUP_NAMES[HEX_ENCODINGS]="Hex Encodings"
+GROUP_NAMES[NUMERIC_ENCODINGS]="Numeric Encodings"
+GROUP_NAMES[BASE_ENCODINGS]="Base Encodings"
+GROUP_NAMES[URL_HTML_UNICODE]="URL / HTML / Unicode"
+GROUP_NAMES[STRING_TRANSFORMS]="String Transforms"
+GROUP_NAMES[PARTIAL_EXPOSURE]="Partial Exposure"
+GROUP_NAMES[STRUCTURED_DATA]="Structured Data Embedding"
+GROUP_NAMES[HASHES]="Hashes (non-reversible)"
+GROUP_NAMES[ARTIFACT_CROSS_JOB]="Artifact Cross-Job"
+
+declare -A GROUP_KEYS
+GROUP_KEYS[CONTROLS]="LITERAL B64_NO_NL"
+GROUP_KEYS[HEX_ENCODINGS]="HEX_XXD HEX_OD HEX_PRINTF"
+GROUP_KEYS[NUMERIC_ENCODINGS]="OCTAL DECIMAL_ASCII BINARY"
+GROUP_KEYS[BASE_ENCODINGS]="B64_WITH_NL BASE32"
+GROUP_KEYS[URL_HTML_UNICODE]="URL_ENCODE URL_ENCODE_ALL HTML_ENTITIES UNICODE_ESC"
+GROUP_KEYS[STRING_TRANSFORMS]="REVERSED SPACED ROT13 UPPER CAESAR1"
+GROUP_KEYS[PARTIAL_EXPOSURE]="FIRST_HALF SECOND_HALF EVEN_CHARS ODD_CHARS"
+GROUP_KEYS[STRUCTURED_DATA]=""
+GROUP_KEYS[HASHES]="MD5 SHA1 SHA256"
+GROUP_KEYS[ARTIFACT_CROSS_JOB]="ARTIFACT_LITERAL ARTIFACT_HEX ARTIFACT_B64 ARTIFACT_B64NL"
+
+check_transform() {
+  local KEY="$1"
+  local EXPECTED_VAL="${EXPECTED[$KEY]:-}"
+
+  if [ -z "$EXPECTED_VAL" ]; then
+    printf "  %-20s  SKIP  (no expected value)\n" "$KEY"
+    return
+  fi
+
+  # Use fixed-string grep to avoid regex issues with special chars
+  if grep -qF "$EXPECTED_VAL" "$LOG_FILE" 2>/dev/null; then
+    printf "  %-20s  \e[31mLEAKED\e[0m\n" "$KEY"
+    LEAKED_LIST+=("$KEY")
   else
-    echo "  MASKED  - $TEST_NAME"
-    return 1
+    printf "  %-20s  \e[32mMASKED\e[0m\n" "$KEY"
+    MASKED_LIST+=("$KEY")
   fi
 }
 
-# --- Test 1: Single-job rotation ---
-echo "[Test 1] Single-Job Rotation"
-check_leak "Original secret after rotation" "$ORIGINAL_SECRET" "$LOG_FILE" || true
-echo ""
-
-# --- Test 2: Multi-job artifact handoff ---
-echo "[Test 2] Multi-Job Artifact Handoff"
-# Check specifically in the print-from-artifact job's output
-if grep -q "print-from-artifact" "$LOG_FILE" 2>/dev/null; then
-  ARTIFACT_LOG=$(mktemp)
-  grep "print-from-artifact" "$LOG_FILE" > "$ARTIFACT_LOG" 2>/dev/null || true
-  check_leak "V1 in artifact job (cross-job)" "$ORIGINAL_SECRET" "$ARTIFACT_LOG" || true
-  rm -f "$ARTIFACT_LOG"
-else
-  echo "  SKIPPED - print-from-artifact job not found in logs"
-fi
-# Also check the zip logs for the artifact job
-if ls "$LOG_ZIP_DIR"/*artifact* 2>/dev/null | head -1 > /dev/null 2>&1; then
-  for f in "$LOG_ZIP_DIR"/*artifact*; do
-    check_leak "V1 in artifact job (zip: $(basename "$f"))" "$ORIGINAL_SECRET" "$f" || true
+for GROUP in "${GROUPS_ORDER[@]}"; do
+  echo "--- ${GROUP_NAMES[$GROUP]} ---"
+  for KEY in ${GROUP_KEYS[$GROUP]}; do
+    check_transform "$KEY"
   done
-elif ls "$LOG_ZIP_DIR"/*print* 2>/dev/null | head -1 > /dev/null 2>&1; then
-  for f in "$LOG_ZIP_DIR"/*print*; do
-    check_leak "V1 in print job (zip: $(basename "$f"))" "$ORIGINAL_SECRET" "$f" || true
-  done
-fi
-echo ""
+  echo ""
+done
 
-# --- Test 3: Continuous output ---
-echo "[Test 3] Continuous Output During Rotation"
-if grep -q "test-continuous-output" "$LOG_FILE" 2>/dev/null; then
-  CONTINUOUS_LOG=$(mktemp)
-  grep "test-continuous-output" "$LOG_FILE" > "$CONTINUOUS_LOG" 2>/dev/null || true
-  check_leak "V1 during continuous output" "$ORIGINAL_SECRET" "$CONTINUOUS_LOG" || true
-  rm -f "$CONTINUOUS_LOG"
-else
-  echo "  SKIPPED - continuous output job not found"
-fi
-echo ""
-
-# --- Test 4: Buffer flush ---
-echo "[Test 4] Buffer Flush Before Print"
-if grep -q "test-buffer-flush" "$LOG_FILE" 2>/dev/null; then
-  BUFFER_LOG=$(mktemp)
-  grep "test-buffer-flush" "$LOG_FILE" > "$BUFFER_LOG" 2>/dev/null || true
-  check_leak "V1 after buffer flush" "$ORIGINAL_SECRET" "$BUFFER_LOG" || true
-  rm -f "$BUFFER_LOG"
-else
-  echo "  SKIPPED - buffer flush job not found"
-fi
-echo ""
-
-# --- Test 5: Late rotation ---
-echo "[Test 5] Late Rotation During Print Phase"
-if grep -q "test-late-rotation" "$LOG_FILE" 2>/dev/null; then
-  LATE_LOG=$(mktemp)
-  grep "test-late-rotation" "$LOG_FILE" > "$LATE_LOG" 2>/dev/null || true
-  check_leak "V1 during late print phase" "$ORIGINAL_SECRET" "$LATE_LOG" || true
-  rm -f "$LATE_LOG"
-else
-  echo "  SKIPPED - late rotation job not found"
-fi
-echo ""
-
-# --- Test 6: GITHUB_OUTPUT passing ---
-echo "[Test 6] GITHUB_OUTPUT Step Passing"
-if grep -q "test-output-passing" "$LOG_FILE" 2>/dev/null; then
-  OUTPUT_LOG=$(mktemp)
-  grep "test-output-passing" "$LOG_FILE" > "$OUTPUT_LOG" 2>/dev/null || true
-  check_leak "V1 via GITHUB_OUTPUT" "$ORIGINAL_SECRET" "$OUTPUT_LOG" || true
-  rm -f "$OUTPUT_LOG"
-else
-  echo "  SKIPPED - output passing job not found"
-fi
-echo ""
-
-# --- Test 7: Live log polling ---
-echo "[Test 7] Live Log Polling (during execution)"
-if [ "$LIVE_LEAK_FOUND" = "true" ]; then
-  LEAKS_FOUND=$((LEAKS_FOUND + 1))
-  TOTAL_TESTS=$((TOTAL_TESTS + 1))
-  echo "  LEAKED  - V1 found in live-streamed logs during execution"
-else
-  TOTAL_TESTS=$((TOTAL_TESTS + 1))
-  echo "  MASKED  - V1 not found in live logs"
-fi
-echo ""
-
-# --- Test 8: Cross-method comparison ---
-echo "[Test 8] Cross-Method Log Comparison"
-ZIP_LEAK=false
-for f in "$LOG_ZIP_DIR"/*; do
-  [ -f "$f" ] || continue
-  if grep -q "$ORIGINAL_SECRET" "$f" 2>/dev/null; then
-    ZIP_LEAK=true
-    echo "  LEAKED  - V1 found in zip log: $(basename "$f")"
-    grep -n "$ORIGINAL_SECRET" "$f" 2>/dev/null | head -3 | while read -r line; do
-      echo "           $line"
-    done
+# Also search for structured data patterns that aren't pre-computed
+# (these appear directly in the logs as key=value, in URLs, etc.)
+echo "--- Structured Data Embedding ---"
+# The workflow prints token=$SECRET in various formats — if the literal is masked,
+# these are masked too. Check for the URL/connection string patterns specifically.
+for PATTERN in "token=${SECRET_VALUE}" "admin:${SECRET_VALUE}@" ; do
+  if grep -qF "$PATTERN" "$LOG_FILE" 2>/dev/null; then
+    printf "  %-20s  \e[31mLEAKED\e[0m\n" "PATTERN: $PATTERN"
+    LEAKED_LIST+=("STRUCT:$PATTERN")
+  else
+    printf "  %-20s  \e[32mMASKED\e[0m\n" "PATTERN: $PATTERN"
   fi
 done
-if [ "$ZIP_LEAK" = "false" ]; then
-  echo "  MASKED  - V1 not found in any zip log files"
-fi
 echo ""
 
-# --- Summary ---
-echo "============================================"
-echo "                 SUMMARY"
-echo "============================================"
+# Summary
+echo "============================================================"
+echo "  SUMMARY"
+echo "============================================================"
 echo ""
-if [ "$LEAKS_FOUND" -gt 0 ]; then
-  echo "  *** BUG REPRODUCED! ***"
+echo "  Total transforms tested: $(( ${#LEAKED_LIST[@]} + ${#MASKED_LIST[@]} ))"
+echo "  Leaked:  ${#LEAKED_LIST[@]}"
+echo "  Masked:  ${#MASKED_LIST[@]}"
+echo ""
+
+if [ ${#LEAKED_LIST[@]} -gt 0 ]; then
+  echo "  LEAKED transforms:"
+  for KEY in "${LEAKED_LIST[@]}"; do
+    VAL="${EXPECTED[$KEY]:-structured pattern}"
+    # Truncate long values
+    if [ ${#VAL} -gt 60 ]; then
+      VAL="${VAL:0:57}..."
+    fi
+    echo "    $KEY = $VAL"
+  done
   echo ""
-  echo "  $LEAKS_FOUND leak(s) found across $TOTAL_TESTS tests."
-  echo ""
-  echo "  The original secret value appeared in clear text in the"
-  echo "  workflow logs after being changed during the run."
+  echo "  These encodings BYPASS GitHub Actions secret masking."
+  echo "  Any workflow that outputs a secret in these formats will"
+  echo "  expose the value in cleartext in the logs."
 else
-  echo "  Bug NOT reproduced."
-  echo ""
-  echo "  0 leaks found across $TOTAL_TESTS tests."
-  echo ""
-  echo "  Suggestions:"
-  echo "    - Increase wait time:   WAIT=120 ./reproduce.sh"
-  echo "    - Try rapid rotations:  RAPID=1 ./reproduce.sh"
-  echo "    - Run multiple times to catch timing-dependent races"
-  echo "    - Try longer windows:   WAIT=300 ./reproduce.sh"
+  echo "  All transforms were properly masked."
 fi
-echo ""
-echo "============================================"
-echo ""
-echo "Full logs:    $LOG_FILE"
-echo "Zip logs:     $LOG_ZIP_DIR"
-echo "Live logs:    $LIVE_LOG_DIR"
-echo "Run URL:      https://github.com/$REPO/actions/runs/$RUN_ID"
 
-# Cleanup: reset the secret to a harmless value
 echo ""
-echo "Cleaning up: resetting secret to a dummy value..."
+echo "============================================================"
+echo ""
+echo "Log file:  $LOG_FILE"
+echo "Run URL:   https://github.com/$REPO/actions/runs/$RUN_ID"
+
+# Cleanup
+echo ""
+echo "Cleaning up..."
 gh secret set "$SECRET_NAME" -R "$REPO" --body "placeholder-rotate-me"
 echo "Done."
