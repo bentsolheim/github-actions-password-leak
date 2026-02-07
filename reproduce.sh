@@ -189,6 +189,12 @@ echo "[5/5] Analyzing logs..."
 LOG_FILE=$(mktemp)
 gh run view "$RUN_ID" -R "$REPO" --log > "$LOG_FILE" 2>/dev/null || true
 
+# Split logs by job for accurate per-job analysis
+TRANSFORM_LOG=$(mktemp)
+ARTIFACT_LOG=$(mktemp)
+grep "^test-masking-transforms" "$LOG_FILE" > "$TRANSFORM_LOG" 2>/dev/null || true
+grep "^print-from-artifact" "$LOG_FILE" > "$ARTIFACT_LOG" 2>/dev/null || true
+
 echo ""
 echo "============================================================"
 echo "  MASKING TRANSFORM RESULTS"
@@ -240,14 +246,15 @@ GROUP_KEYS[ARTIFACT_CROSS_JOB]="ARTIFACT_LITERAL ARTIFACT_HEX ARTIFACT_B64 ARTIF
 check_transform() {
   local KEY="$1"
   local EXPECTED_VAL="${EXPECTED[$KEY]:-}"
+  local SEARCH_FILE="${2:-$TRANSFORM_LOG}"
 
   if [ -z "$EXPECTED_VAL" ]; then
     printf "  %-20s  SKIP  (no expected value)\n" "$KEY"
     return
   fi
 
-  # Use fixed-string grep to avoid regex issues with special chars
-  if grep -qF "$EXPECTED_VAL" "$LOG_FILE" 2>/dev/null; then
+  # Use fixed-string grep on the per-job log (not the whole file)
+  if grep -qF "$EXPECTED_VAL" "$SEARCH_FILE" 2>/dev/null; then
     printf "  %-20s  \e[31mLEAKED\e[0m\n" "$KEY"
     LEAKED_LIST+=("$KEY")
   else
@@ -258,19 +265,23 @@ check_transform() {
 
 for GROUP in "${GROUPS_ORDER[@]}"; do
   echo "--- ${GROUP_NAMES[$GROUP]} ---"
-  for KEY in ${GROUP_KEYS[$GROUP]}; do
-    check_transform "$KEY"
-  done
+  if [ "$GROUP" = "ARTIFACT_CROSS_JOB" ]; then
+    # Artifact tests use the artifact job's log, not the transform job
+    for KEY in ${GROUP_KEYS[$GROUP]}; do
+      check_transform "$KEY" "$ARTIFACT_LOG"
+    done
+  else
+    for KEY in ${GROUP_KEYS[$GROUP]}; do
+      check_transform "$KEY"
+    done
+  fi
   echo ""
 done
 
-# Also search for structured data patterns that aren't pre-computed
-# (these appear directly in the logs as key=value, in URLs, etc.)
+# Structured data patterns (search transform job log only)
 echo "--- Structured Data Embedding ---"
-# The workflow prints token=$SECRET in various formats — if the literal is masked,
-# these are masked too. Check for the URL/connection string patterns specifically.
 for PATTERN in "token=${SECRET_VALUE}" "admin:${SECRET_VALUE}@" ; do
-  if grep -qF "$PATTERN" "$LOG_FILE" 2>/dev/null; then
+  if grep -qF "$PATTERN" "$TRANSFORM_LOG" 2>/dev/null; then
     printf "  %-20s  \e[31mLEAKED\e[0m\n" "PATTERN: $PATTERN"
     LEAKED_LIST+=("STRUCT:$PATTERN")
   else
