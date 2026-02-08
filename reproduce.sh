@@ -112,35 +112,38 @@ echo "[6/6] Analyzing logs..."
 LOG_FILE=$(mktemp)
 gh run view "$RUN_ID" -R "$REPO" --log > "$LOG_FILE" 2>/dev/null || true
 
-# Extract print job logs only
+# Extract per-job logs
+CAPTURE_LOG=$(mktemp)
 PRINT_LOG=$(mktemp)
+grep "^capture" "$LOG_FILE" > "$CAPTURE_LOG" 2>/dev/null || true
 grep "^print" "$LOG_FILE" > "$PRINT_LOG" 2>/dev/null || true
 
+# Check all four cells of the masking matrix
+v1_in_capture="MASKED";  grep -qF "$V1" "$CAPTURE_LOG" 2>/dev/null && v1_in_capture="LEAKED"
+v2_in_capture="MASKED";  grep -qF "$V2" "$CAPTURE_LOG" 2>/dev/null && v2_in_capture="LEAKED"
+v1_in_print="MASKED";    grep -qF "$V1" "$PRINT_LOG"   2>/dev/null && v1_in_print="LEAKED"
+v2_in_print="MASKED";    grep -qF "$V2" "$PRINT_LOG"   2>/dev/null && v2_in_print="LEAKED"
+
 echo ""
 echo "============================================"
-echo " RESULTS"
+echo " RESULTS — Masking Matrix"
 echo "============================================"
 echo ""
-
-LEAKED=false
-
-if grep -qF "$V1" "$PRINT_LOG" 2>/dev/null; then
-  echo "  V1 in print job:  LEAKED"
-  LEAKED=true
-else
-  echo "  V1 in print job:  MASKED"
-fi
-
-if grep -qF "$V2" "$PRINT_LOG" 2>/dev/null; then
-  echo "  V2 in print job:  PRESENT (expected if masking V2)"
-else
-  echo "  V2 in print job:  NOT FOUND"
-fi
+printf "  %-12s %-18s %-18s\n" "Job" "V1 (old secret)" "V2 (new secret)"
+printf "  %-12s %-18s %-18s\n" "----------" "----------------" "----------------"
+printf "  %-12s %-18s %-18s\n" "capture" "$v1_in_capture" "$v2_in_capture"
+printf "  %-12s %-18s %-18s\n" "print" "$v1_in_print" "$v2_in_print"
 
 echo ""
-if [ "$LEAKED" = true ]; then
+if [ "$v1_in_capture" = "MASKED" ] && [ "$v2_in_capture" = "MASKED" ] \
+   && [ "$v1_in_print" = "LEAKED" ] && [ "$v2_in_print" = "MASKED" ]; then
+  echo "  RESULT: Bug reproduced."
+  echo "  V1 is correctly masked in the capture job but leaks in the print job"
+  echo "  after secret rotation. V2 is masked everywhere."
+elif [ "$v1_in_print" = "LEAKED" ]; then
   echo "  RESULT: V1 LEAKED in cross-job output."
   echo "  The old secret value appeared unmasked in the print job."
+  echo "  (Some matrix cells differ from expected — see above.)"
 else
   echo "  RESULT: V1 was masked. Leak not reproduced."
 fi
@@ -153,5 +156,5 @@ echo "Run URL:   https://github.com/$REPO/actions/runs/$RUN_ID"
 echo ""
 echo "Cleaning up..."
 gh secret set "$SECRET_NAME" -R "$REPO" --body "placeholder-rotate-me"
-rm -f "$PRINT_LOG"
+rm -f "$CAPTURE_LOG" "$PRINT_LOG"
 echo "Done."
