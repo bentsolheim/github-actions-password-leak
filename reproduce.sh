@@ -87,20 +87,23 @@ fi
 echo "  Run: $RUN_ID"
 echo "  URL: https://github.com/$REPO/actions/runs/$RUN_ID"
 
-# Step 4: Wait for capture job to finish, then rotate
-echo "[4/6] Waiting for capture job to complete before rotating..."
+# Step 4: Rotate secret during capture job's wait window
+echo "[4/6] Waiting for capture job to start, then rotating mid-sleep..."
 while true; do
   CAPTURE_STATUS=$(gh run view "$RUN_ID" -R "$REPO" --json jobs \
     --jq '.jobs[] | select(.name == "capture") | .status' 2>/dev/null || true)
-  if [ "$CAPTURE_STATUS" = "completed" ]; then
+  if [ "$CAPTURE_STATUS" = "in_progress" ] || [ "$CAPTURE_STATUS" = "completed" ]; then
     break
   fi
   echo "  capture job status: ${CAPTURE_STATUS:-unknown}, waiting 5s..."
   sleep 5
 done
-echo "  capture job completed. Rotating secret to V2..."
+# Give the encode step time to finish before we rotate
+echo "  capture job is running. Waiting 15s for encode step to complete..."
+sleep 15
+echo "  Rotating secret to V2 (during capture job's sleep window)..."
 gh secret set "$SECRET_NAME" -R "$REPO" --body "$V2"
-echo "  Rotated."
+echo "  Rotated. Print job will get V2 in its masking dictionary."
 
 # Step 5: Wait for workflow to complete
 echo "[5/6] Waiting for workflow to complete..."
