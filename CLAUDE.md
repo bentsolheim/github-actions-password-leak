@@ -2,20 +2,19 @@
 
 ## Project Overview
 
-This repository attempts to reproduce a bug in GitHub Actions where rotating a
-repository secret while a workflow is running causes the old secret value to
-appear unmasked in workflow logs.
+This repository reproduces a bug in GitHub Actions where rotating a repository
+secret while a workflow is running causes the old secret value to appear
+unmasked in workflow logs via cross-job output forwarding.
 
 ## Key Files
 
-- `.github/workflows/secret-leak-test.yml` - Workflow that captures a secret,
-  waits, then prints it in various formats to test masking
-- `reproduce.sh` - Automated script that triggers the workflow and rotates
-  the secret mid-run, then checks logs for leaks
+- `.github/workflows/cross-job-secret-leak.yml` - Two-job workflow: capture
+  encodes the secret as a job output, print decodes and prints it after rotation
+- `reproduce.sh` - Automated script that triggers the workflow, rotates the
+  secret between jobs, and checks logs for leaks
 
 ## Development
 
-- Branch: `claude/reproduce-secrets-bug-ysKN2`
 - The workflow uses `workflow_dispatch` with a configurable `wait_seconds` input
 - The `TEST_SECRET` repository secret is the target for rotation testing
 - `reproduce.sh` requires `gh` CLI authenticated with repo and secrets access
