@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 #
-# reproduce.sh - Cross-job secret leak via job outputs
+# run-mitigated.sh — A/B experiment: MITIGATED workflow
 #
-# Demonstrates that rotating a secret between two jobs causes V1 to appear
-# unmasked in the second job's logs. The second job's masking dict only
-# knows V2, so V1 prints in cleartext.
+# Runs the mitigated workflow (direct ${{ secrets.TEST_SECRET }} reference in
+# both jobs). This forces the runner to add all known secret values — including
+# the pre-rotation V1 — to each job's masking dictionary, so V1 stays masked.
 #
 # Prerequisites:
 #   - gh CLI installed and authenticated
 #   - Repository: bentsolheim/github-actions-password-leak (or set REPO)
 #
 # Usage:
-#   ./reproduce.sh
-#   WAIT=60 ./reproduce.sh
+#   ./run-mitigated.sh
+#   WAIT=60 ./run-mitigated.sh
 
 set -euo pipefail
 
@@ -23,10 +23,10 @@ TIMESTAMP=$(date +%s)
 SECRET_NAME="TEST_SECRET"
 V1="cross-job-v1-${TIMESTAMP}"
 V2="cross-job-v2-${TIMESTAMP}"
-WORKFLOW="cross-job-secret-leak.yml"
+WORKFLOW="mitigated.yml"
 
 echo "============================================"
-echo " Cross-Job Secret Leak (Job Outputs)"
+echo " A/B Experiment — Mitigated Workflow"
 echo "============================================"
 echo ""
 echo "Repository:  $REPO"

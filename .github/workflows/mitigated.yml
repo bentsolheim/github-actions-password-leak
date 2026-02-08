@@ -1,4 +1,4 @@
-name: Cross-Job Secret Leak (Old)
+name: "Mitigated: Cross-Job Secret Leak"
 
 on:
   workflow_dispatch:
@@ -14,6 +14,12 @@ jobs:
     outputs:
       encoded: ${{ steps.encode.outputs.value }}
     steps:
+      - name: Print secret (should be masked)
+        env:
+          SECRET: ${{ secrets.TEST_SECRET }}
+        run: |
+          echo "CAPTURE_SECRET_VALUE: $SECRET"
+
       - name: Encode and set output
         id: encode
         env:
@@ -32,6 +38,12 @@ jobs:
     needs: capture
     runs-on: ubuntu-latest
     steps:
+      - name: Print current secret (should be masked)
+        env:
+          SECRET: ${{ secrets.TEST_SECRET }}
+        run: |
+          echo "PRINT_CURRENT_SECRET: $SECRET"
+
       - name: Decode and print
         env:
           ENCODED: ${{ needs.capture.outputs.encoded }}

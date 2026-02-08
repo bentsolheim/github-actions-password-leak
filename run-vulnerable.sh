@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 #
-# reproduce-old.sh - Cross-job secret leak via job outputs (old workflow)
+# run-vulnerable.sh — A/B experiment: VULNERABLE workflow
 #
-# Runs the old workflow (no echo steps that reference secrets in both jobs)
-# to test whether it still leaks. Uses the same mid-sleep rotation timing
-# as reproduce.sh so the only variable is the workflow content.
+# Runs the vulnerable workflow (no direct ${{ secrets.TEST_SECRET }} reference
+# in the print job). The print job's masking dictionary never learns V1, so
+# V1 leaks in cleartext after rotation.
 #
 # Prerequisites:
 #   - gh CLI installed and authenticated
 #   - Repository: bentsolheim/github-actions-password-leak (or set REPO)
 #
 # Usage:
-#   ./reproduce-old.sh
-#   WAIT=60 ./reproduce-old.sh
+#   ./run-vulnerable.sh
+#   WAIT=60 ./run-vulnerable.sh
 
 set -euo pipefail
 
@@ -23,10 +23,10 @@ TIMESTAMP=$(date +%s)
 SECRET_NAME="TEST_SECRET"
 V1="cross-job-v1-${TIMESTAMP}"
 V2="cross-job-v2-${TIMESTAMP}"
-WORKFLOW="cross-job-secret-leak-old.yml"
+WORKFLOW="vulnerable.yml"
 
 echo "============================================"
-echo " Cross-Job Secret Leak (Old Workflow)"
+echo " A/B Experiment — Vulnerable Workflow"
 echo "============================================"
 echo ""
 echo "Repository:  $REPO"
